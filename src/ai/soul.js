@@ -7,7 +7,15 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const SOUL_DIR = path.join(__dirname, '../../soul');
 
 function read(file, fallback = '') {
-  try { return fs.readFileSync(path.join(SOUL_DIR, file), 'utf8').trim(); }
+  try {
+    const baseFull = path.resolve(SOUL_DIR);
+    const target = path.join(baseFull, file);
+    const rel = path.relative(baseFull, target);
+    if (rel === '..' || rel.startsWith(`..${path.sep}`) || path.isAbsolute(rel)) {
+      return fallback;
+    }
+    return fs.readFileSync(target, 'utf8').trim();
+  }
   catch { return fallback; }
 }
 
