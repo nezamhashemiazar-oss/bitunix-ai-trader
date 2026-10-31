@@ -48,6 +48,13 @@ pool.query = async (text, params) => {
 };
 
 // Seed the settings this suite cares about (schema-validated, memory store).
+// auto_trade: live entries are gated at the execution boundary inside
+// openFromSignal() — MCP, Telegram, scans and this suite all converge there, so
+// an unseeded (default OFF) value refuses the entry with "live entries are
+// disabled" before any of the leverage-sync logic below can run. This suite
+// tests the leverage maths, not the authorization gate, so it authorizes the
+// entries explicitly (test-safety-static.js owns the gate's own regression check).
+await setSetting('auto_trade', true, 'test');
 await setSetting('leverage', 50, 'test');
 await setSetting('margin_pct', 5, 'test');
 await setSetting('margin_mode', 'CROSS', 'test');
@@ -112,11 +119,20 @@ function install({ heldLev = 50, changeRefuses = false } = {}) {
   bitunix.tierFor = async () => ({ mmr: 0.005, level: 1, startValue: 0, endValue: 100000 });
   bitunix.roundPrice = async (s, px) => Number(px).toFixed(8);
   bitunix.roundQty = async (s, q) => Number(q).toFixed(4);
+  let lastQty = 0;
   bitunix.placeOrder = async (body) => {
+    lastQty = Number(body.qty);
     calls.push(['placeOrder', body.qty, body.slPrice, body.tpPrice]);
     return { orderId: 'o-1' };
   };
-  bitunix.getOrderDetail = async () => [{ status: 'FILLED', tradeQty: 0 }];
+  // get_order_detail reports the quantity the order actually traded in
+  // `tradeQty`. A FILLED order with tradeQty 0 is not a fill: the executor
+  // refuses to book one ("fill quantity could not be confirmed") and then
+  // reconciles against live positions — and this fixture's book holds only an
+  // unrelated ETHUSDT position. Reporting the placed quantity here is what a
+  // real filled MARKET order looks like, and it keeps this suite measuring
+  // leverage sync instead of the (separately tested) fill-confirmation guard.
+  bitunix.getOrderDetail = async () => [{ status: 'FILLED', tradeQty: lastQty }];
   bitunix.getHistoryPositions = async () => ({ positionList: [] });
 }
 

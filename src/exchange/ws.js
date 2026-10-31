@@ -24,10 +24,20 @@ class BitunixSocket extends EventEmitter {
     this.alive = false;
     this.loggedIn = false;
     this.backoff = 1000;
+    this._retryTimer = null;
+    this._closed = false;
+    // The 250ms out-queue pump exists only to move messages onto the socket.
+    // It must not be the reason a process stays alive: this interval used to be
+    // ref'd, so ANY process that merely imported this module — every test suite,
+    // a one-shot script, or the bot after stop() — hung forever after its last
+    // statement instead of exiting. node tests/run.js never finished, and a
+    // SIGINT shutdown could not complete while a socket was down.
     this._pump = setInterval(() => this._flush(), 250); // <=4 msg/s
+    if (typeof this._pump.unref === 'function') this._pump.unref();
   }
 
   connect() {
+    if (this._closed) return;
     if (this.ws && (this.ws.readyState === WebSocket.OPEN || this.ws.readyState === WebSocket.CONNECTING)) return;
     this.ws = new WebSocket(this.url);
 
@@ -59,8 +69,13 @@ class BitunixSocket extends EventEmitter {
     this.ws.on('close', () => {
       this.alive = false; this.loggedIn = false;
       clearInterval(this.pingTimer);
+      if (this._closed) return;   // close() asked for this; do not reconnect
       log.warn(`closed ${this.url}, reconnecting in ${this.backoff}ms`);
-      setTimeout(() => this.connect(), this.backoff);
+      // Unref'd for the same reason as the pump: a pending reconnect must not
+      // hold the process open once everything else has stopped.
+      clearTimeout(this._retryTimer);
+      this._retryTimer = setTimeout(() => this.connect(), this.backoff);
+      if (typeof this._retryTimer.unref === 'function') this._retryTimer.unref();
       this.backoff = Math.min(this.backoff * 2, 30_000);
     });
 
@@ -81,6 +96,7 @@ class BitunixSocket extends EventEmitter {
     this.pingTimer = setInterval(() => {
       this.send({ op: 'ping', ping: Math.floor(Date.now() / 1000) });
     }, 5_000);
+    if (typeof this.pingTimer.unref === 'function') this.pingTimer.unref();
   }
 
   send(obj) { this.outQueue.push(obj); }
@@ -116,8 +132,13 @@ class BitunixSocket extends EventEmitter {
   }
 
   close() {
+    // Mark closed FIRST: the socket's own 'close' handler runs asynchronously
+    // and would otherwise schedule another reconnect after stop().
+    this._closed = true;
     clearInterval(this._pump);
     clearInterval(this.pingTimer);
+    clearTimeout(this._retryTimer);
+    this._retryTimer = null;
     try { this.ws?.close(); } catch {}
   }
 }
