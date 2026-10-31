@@ -1,4 +1,15 @@
 /**
+ * Security test for /simplify command - Path Traversal Mitigation
+ *
+ * Tests that the /simplify command properly prevents file inclusion attacks
+ * via path traversal attempts. The mitigation checks that resolved paths
+ * stay within the process.cwd() boundary.
+ *
+ * Attack vectors tested:
+ *   1. Classic path traversal with ../
+ *   2. Absolute path injection
+ *   3. Multiple levels of traversal
+ *   4. Mixed traversal patterns
  * Security test for /simplify command — path traversal mitigation.
  *
  * This test verifies that the /simplify command properly rejects attempts to
@@ -33,20 +44,17 @@ const assert = (c, m) => {
 const here = path.dirname(fileURLToPath(import.meta.url));
 const projectRoot = path.resolve(here, '..');
 
-// ---------------------------------------------------------------- the harness
 let passed = 0, failed = 0;
 const assert = (c, m) => { c ? (passed++, console.log(`  ok  ${m}`)) : (failed++, console.log(`  FAIL ${m}`)); };
-const includes = (hay, needle) => String(hay).includes(needle);
-
-const CHAT = 12345;
 
 async function test() {
+  console.log('=== /simplify command Security - Path Traversal Mitigation ===\n');
   console.log('=== /simplify command — path traversal security ===\n');
   console.log('=== /simplify security — path traversal mitigation ===\n');
 
-  // A bot that captures instead of sending.
+  // Capture sent messages
   const sent = [];
-  const fakeBot = {
+  const fakeBotCapture = {
     sendMessage: (chatId, text) => { sent.push({ chatId, text }); return []; },
     sendTyping: async () => {},
   };
@@ -341,4 +349,5 @@ async function test() {
   process.exit(failed ? 1 : 0);
 }
 
+test();
 test().catch((e) => { console.error(e); process.exit(1); });
