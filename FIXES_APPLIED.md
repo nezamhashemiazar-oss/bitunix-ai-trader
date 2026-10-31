@@ -31,3 +31,51 @@ Not verified:
 - Keep `AUTO_TRADE_PERSIST=false` (or unset). Use `/autotrade on` only when deliberately authorizing live entries.
 - Do not enable live trading until a clean `npm ci`, full `npm test`, exchange testnet contract tests, and manual review pass.
 - This uploaded application remains JavaScript/Node.js, not the separate Go J+rock agent requested in the project brief.
+
+## Follow-up fixes (2026-10-31)
+
+Three defects surfaced by running the suite end to end (`node_modules` is now
+installable, so `npm test` actually executes). Two were real bugs in shipped
+code; the third was a suite that had drifted out of date with the safety patch
+above.
+
+1. **A dead 1m candle feed killed the whole guard loop** (`src/trading/manager.js`).
+   The pass ATR selection — execution-TF (1m) ATR, falling back to the
+   structure-TF ATR via `stopAtrFor()` — was computed *after* the price/ATR gate,
+   and that gate tested the raw 1m `atr`. When the 1m kline fetch failed (its own
+   `try/catch` swallows it, leaving `atr` null), every position was skipped with
+   "valid price/ATR unavailable; guard pass fails closed": no rescue bracket, no
+   breakeven, no trailing — while the structure-TF candles that the fallback
+   wanted were fine. The fallback was unreachable dead code. The selection is now
+   resolved before the gate, the gate tests the resolved `guardAtr`, and the
+   rescue attach path sizes off the same value.
+2. **The WebSocket feed pinned every process alive** (`src/exchange/ws.js`).
+   `BitunixSocket`'s constructor started a *ref'd* 250 ms out-queue pump, and
+   `MarketFeed` builds two sockets at module load. So any process that merely
+   imported the feed printed its last line and then hung: `npm test` never
+   finished (its last suite passed every assertion and then sat in `epoll_wait`),
+   and a SIGINT `stop()` could not complete while a reconnect was pending. The
+   pump, the 5 s ping timer and the reconnect timer are now unref'd, `close()`
+   clears all three, and `connect()`/the `close` event refuse to reconnect once
+   `close()` has been called. New regression suite:
+   `node tests/test-ws-timers.js` (verified to fail 6 assertions against the old
+   module).
+
+Suite-only corrections, no production behavior changed:
+
+- `tests/test-leverage-sync.js` seeds `auto_trade: true`. The execution-boundary
+  authorization gate (change 1 above) refuses every entry before the leverage
+  logic it was written to measure; `test-safety-static.js` still owns the gate's
+  own regression check. Its `get_order_detail` stub also returned
+  `{ status: 'FILLED', tradeQty: 0 }`, i.e. a "fill" of zero quantity, which the
+  fill-confirmation guard (change 5) correctly refuses; the stub now reports the
+  quantity actually placed.
+
+Verification after these fixes:
+
+- `npm test` — all 22 suites pass, and the run terminates on its own.
+- `npm run check` — syntax validation of 57 JavaScript files.
+- `node tests/test-manage-loop.js` — 60/60 (the structure-TF ATR fallback case
+  previously failed 1).
+- `node tests/test-ws-timers.js` — 9/9.
+- No live exchange calls were made.

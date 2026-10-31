@@ -1539,7 +1539,7 @@ export function createCommandHandler(ctx) {
       const filePath = path.join(baseFull, file);
       const rel = path.relative(baseFull, filePath);
       if (rel === '..' || rel.startsWith(`..${path.sep}`) || path.isAbsolute(rel)) {
-        return reply(chatId, mdt`Invalid file path`);
+        return reply(chatId, mdt`❌ Invalid file path`);
       }
       if (!fs.existsSync(filePath)) {
         return reply(chatId, mdt`❌ File not found: ${file}`);
