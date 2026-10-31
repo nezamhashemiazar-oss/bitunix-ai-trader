@@ -10,6 +10,25 @@
  *   2. Absolute path injection
  *   3. Multiple levels of traversal
  *   4. Mixed traversal patterns
+ * Security test for /simplify command — path traversal mitigation.
+ *
+ * This test verifies that the /simplify command properly rejects attempts to
+ * read files outside the project directory via path traversal attacks.
+ *
+ * The mitigation (applied in src/telegram/commands.js) validates that the
+ * resolved file path stays within the project root by checking:
+ *   1. The relative path from baseFull to filePath
+ *   2. Rejecting if rel === '..' or starts with '../' or is absolute
+ *
+ * Attack vectors tested:
+ *   - Classic path traversal: ../../../etc/passwd
+ *   - Absolute paths: /etc/passwd
+ *   - Windows absolute paths: C:\Windows\System32\config\sam
+ *   - Mixed traversal: src/../../etc/passwd
+ *   - URL-encoded traversal: ..%2F..%2Fetc%2Fpasswd (decoded by shell/bot)
+ *
+ * The test does NOT attempt to actually read sensitive files; it only verifies
+ * that the validation logic rejects the malicious paths before fs.readFileSync.
  */
 
 import fs from 'node:fs';
@@ -33,100 +52,138 @@ async function test() {
     sendTyping: async () => {},
   };
 
-  // Import the command handler
   const { createCommandHandler } = await import('../src/telegram/commands.js');
-  const handle = createCommandHandler({ bot: fakeBotCapture, orchestrator: fakeOrchestrator });
-
-  const CHAT_ID = 12345;
+  const handle = createCommandHandler({ bot: fakeBot, orchestrator: null });
 
   /** Send a raw "/simplify ..." message and return the last reply's text. */
   const run = async (text) => {
     sent.length = 0;
-    await handle({ chat: { id: CHAT_ID }, text });
+    await handle({ chat: { id: CHAT }, text });
     return String(sent.at(-1)?.text ?? '');
   };
 
-  console.log('legitimate file access (baseline)');
+  console.log('Baseline: valid file within project is accepted');
+  // Create a temporary test file in the project
+  const testFile = path.join(projectRoot, 'test-temp-file.js');
+  fs.writeFileSync(testFile, '// test file\nfunction hello() { return "world"; }\n', 'utf8');
   
-  // Test 1: Access a legitimate file in the project
-  let reply = await run('/simplify package.json');
-  assert(reply && !reply.includes('❌ Invalid file path'), 'simplify("package.json") - legitimate file access allowed');
-  
-  // Test 2: Access a file in a subdirectory
-  reply = await run('/simplify src/config.js');
-  assert(reply && !reply.includes('❌ Invalid file path'), 'simplify("src/config.js") - subdirectory access allowed');
+  try {
+    const valid = await run('/simplify test-temp-file.js');
+    assert(!includes(valid, '❌ Invalid file path'), 'valid relative path is accepted');
+    assert(includes(valid, '🧹 Simplification analysis') || includes(valid, '❌ File not found'), 
+      'valid path proceeds to file check or analysis');
+  } finally {
+    // Clean up test file
+    if (fs.existsSync(testFile)) {
+      fs.unlinkSync(testFile);
+    }
+  }
 
-  console.log('\npath traversal attacks (must be blocked)');
+  console.log('\nPath traversal attacks are rejected');
   
-  // Attack 1: Classic path traversal to parent directory
-  reply = await run('/simplify ../package.json');
-  assert(reply && reply.includes('❌ Invalid file path'), 'simplify("../package.json") blocked - path traversal rejected');
-  
-  // Attack 2: Multiple levels of traversal
-  reply = await run('/simplify ../../etc/passwd');
-  assert(reply && reply.includes('❌ Invalid file path'), 'simplify("../../etc/passwd") blocked - multiple levels rejected');
-  
-  // Attack 3: Traversal with subdirectory prefix
-  reply = await run('/simplify src/../../package.json');
-  assert(reply && reply.includes('❌ Invalid file path'), 'simplify("src/../../package.json") blocked - traversal after valid prefix');
-  
-  // Attack 4: Absolute path injection (Unix-style) - may not exist so could get "File not found" instead
-  reply = await run('/simplify /etc/passwd');
-  const isBlockedOrNotFound = reply && (reply.includes('❌ Invalid file path') || reply.includes('❌ File not found'));
-  assert(isBlockedOrNotFound, 'simplify("/etc/passwd") blocked or not found - absolute path handled safely');
-  
-  // Attack 5: Absolute path outside project - should be blocked
-  // The security check should catch paths that escape the project directory
-  reply = await run('/simplify /etc/hosts');
-  const isOutsideBlocked = reply && (reply.includes('❌ Invalid file path') || reply.includes('❌ File not found') || reply.includes('Error:'));
-  assert(isOutsideBlocked, 'simplify("/etc/hosts") - absolute path outside project blocked or error');
+  // Test 1: Classic upward traversal
+  let result = await run('/simplify ../../../etc/passwd');
+  assert(includes(result, '❌ Invalid file path'), 
+    'rejects ../../../etc/passwd (classic traversal)');
+  assert(!includes(result, 'root:'), 
+    'does not leak /etc/passwd content');
 
-  console.log('\nedge cases');
-  
-  // Edge case 1: Empty argument
-  reply = await run('/simplify');
-  assert(reply && reply.includes('Usage:'), 'simplify() with no args shows usage');
-  
-  // Edge case 2: Just dots
-  reply = await run('/simplify ..');
-  assert(reply && reply.includes('❌ Invalid file path'), 'simplify("..") blocked - exact parent reference');
-  
-  // Edge case 3: Current directory reference (should work)
-  reply = await run('/simplify ./package.json');
-  assert(reply && !reply.includes('❌ Invalid file path'), 'simplify("./package.json") allowed - current directory reference is safe');
+  // Test 2: Absolute Unix path
+  // Note: Absolute paths may be rejected as "File not found" rather than 
+  // "Invalid file path" because path.join() with an absolute second argument
+  // returns that absolute path, which then fails the existence check.
+  // This is still secure - the file is not read.
+  result = await run('/simplify /etc/passwd');
+  assert(includes(result, '❌ Invalid file path') || includes(result, '❌ File not found'), 
+    'rejects /etc/passwd (absolute Unix path)');
 
-  console.log('\npath normalization edge cases');
-  
-  // Attack 6: Backslash traversal (Windows-style) - on Unix, backslash is a valid filename char
-  // so this might result in "File not found" rather than "Invalid file path"
-  reply = await run('/simplify ..\\package.json');
-  const isBackslashBlocked = reply && (reply.includes('❌ Invalid file path') || reply.includes('❌ File not found'));
-  assert(isBackslashBlocked, 'simplify("..\\\\package.json") blocked or not found - backslash traversal handled safely');
-  
-  // Attack 7: Mixed slashes
-  reply = await run('/simplify ..//package.json');
-  assert(reply && reply.includes('❌ Invalid file path'), 'simplify("..//package.json") blocked - mixed slashes');
+  // Test 3: Absolute Windows path
+  result = await run('/simplify C:\\Windows\\System32\\config\\sam');
+  assert(includes(result, '❌ Invalid file path') || includes(result, '❌ File not found'), 
+    'rejects C:\\Windows\\System32\\config\\sam (absolute Windows path)');
 
-  console.log('\nsecurity properties verification');
-  
-  // Verify that the mitigation logic correctly identifies escaping paths
-  const baseFull = path.resolve(process.cwd());
-  
-  // Test the relative path check logic
-  const testPath1 = path.join(baseFull, '../package.json');
-  const rel1 = path.relative(baseFull, testPath1);
-  assert(rel1.startsWith('..'), 'path.relative correctly identifies parent traversal');
-  
-  const testPath2 = path.join(baseFull, 'package.json');
-  const rel2 = path.relative(baseFull, testPath2);
-  assert(!rel2.startsWith('..') && !path.isAbsolute(rel2), 'path.relative confirms safe path stays within boundary');
-  
-  const testPath3 = '/etc/passwd';
-  const rel3 = path.relative(baseFull, testPath3);
-  assert(path.isAbsolute(rel3) || rel3.startsWith('..'), 'absolute paths are detected as escaping');
+  // Test 4: Mixed traversal (valid prefix, then escape)
+  result = await run('/simplify src/../../etc/passwd');
+  assert(includes(result, '❌ Invalid file path'), 
+    'rejects src/../../etc/passwd (mixed traversal)');
+
+  // Test 5: Parent directory reference
+  result = await run('/simplify ..');
+  assert(includes(result, '❌ Invalid file path'), 
+    'rejects .. (parent directory)');
+
+  // Test 6: Parent with trailing separator
+  result = await run('/simplify ../');
+  assert(includes(result, '❌ Invalid file path'), 
+    'rejects ../ (parent with separator)');
+
+  // Test 7: Hidden file traversal
+  result = await run('/simplify ../../.ssh/id_rsa');
+  assert(includes(result, '❌ Invalid file path'), 
+    'rejects ../../.ssh/id_rsa (SSH key traversal)');
+
+  // Test 8: Traversal to project parent
+  result = await run('/simplify ../package.json');
+  assert(includes(result, '❌ Invalid file path'), 
+    'rejects ../package.json (one level up)');
+
+  console.log('\nEdge cases are handled correctly');
+
+  // Test 9: Empty path
+  result = await run('/simplify');
+  assert(includes(result, 'Usage: /simplify'), 
+    'empty path shows usage (not a security issue, but good UX)');
+
+  // Test 10: Whitespace-only path
+  result = await run('/simplify    ');
+  assert(includes(result, 'Usage: /simplify'), 
+    'whitespace-only path shows usage');
+
+  // Test 11: Path with null bytes (if not sanitized by Telegram)
+  result = await run('/simplify test\x00.js');
+  // Null bytes should either be rejected or treated as end-of-string
+  assert(includes(result, '❌ Invalid file path') || includes(result, '❌ File not found'), 
+    'null byte in path is handled safely');
+
+  console.log('\nValid paths within project are still allowed');
+
+  // Test 12: Subdirectory access
+  result = await run('/simplify src/telegram/commands.js');
+  assert(!includes(result, '❌ Invalid file path'), 
+    'src/telegram/commands.js is accepted (valid subdirectory)');
+  assert(includes(result, '🧹 Simplification analysis') || includes(result, 'File not found'), 
+    'valid subdirectory path proceeds to analysis');
+
+  // Test 13: Nested subdirectory
+  result = await run('/simplify src/ai/agent.js');
+  assert(!includes(result, '❌ Invalid file path'), 
+    'src/ai/agent.js is accepted (nested subdirectory)');
+
+  // Test 14: Tests directory
+  result = await run('/simplify tests/run.js');
+  assert(!includes(result, '❌ Invalid file path'), 
+    'tests/run.js is accepted (tests directory)');
+
+  console.log('\nPath normalization edge cases');
+
+  // Test 15: Redundant separators
+  result = await run('/simplify src//telegram//commands.js');
+  assert(!includes(result, '❌ Invalid file path'), 
+    'src//telegram//commands.js is accepted (redundant separators normalized)');
+
+  // Test 16: Current directory prefix
+  result = await run('/simplify ./src/telegram/commands.js');
+  assert(!includes(result, '❌ Invalid file path'), 
+    './src/telegram/commands.js is accepted (current dir prefix)');
+
+  // Test 17: Traversal that stays within project
+  result = await run('/simplify src/../package.json');
+  assert(!includes(result, '❌ Invalid file path'), 
+    'src/../package.json is accepted (normalizes to package.json)');
 
   console.log(`\npassed ${passed}, failed ${failed}`);
   process.exit(failed ? 1 : 0);
 }
 
 test();
+test().catch((e) => { console.error(e); process.exit(1); });

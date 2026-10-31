@@ -223,6 +223,20 @@ export async function manageOpenPositions({ notify = null } = {}) {
         if (Number.isFinite(a) && a > 0) tframes[t] = { atr: a };
       } catch {}
     }
+    // Which ATR this pass is allowed to work from.
+    //
+    // The execution-TF (1m) ATR above is the preferred one — trailing scales to
+    // it because the structure-TF ATR is 2-3x larger and leaves the trail
+    // behind breakeven, so it never activates. But the 1m kline is fetched in
+    // its own try/catch: when that fetch fails, `atr` is null while the
+    // structure-TF candles above still work. This selection must therefore be
+    // resolved BEFORE the price/ATR gate below — that gate used to test `atr`
+    // directly, so a dead 1m feed aborted the whole guard pass for every
+    // position (no breakeven, no trailing, no rescue bracket) and the fallback
+    // computed further down was unreachable dead code.
+    const stopPick = Number(atr) > 0 ? null : stopAtrFor({ atr, timeframes: tframes }, s);
+    const guardAtr = (Number(atr) > 0 ? atr : stopPick?.atr) || null;
+
     // 0) software stop: the exchange refused to move the SL earlier, so enforce
     //    the wanted level ourselves. Without this a winner reverses into a loss
     //    while the original wide stop sits untouched.
@@ -264,7 +278,7 @@ export async function manageOpenPositions({ notify = null } = {}) {
       log.warn(`${p.symbol}: effective liquidation price unavailable; guard pass fails closed`);
       continue;
     }
-    if (!(Number(atr) > 0) || !(Number(price) > 0)) {
+    if (!(Number(guardAtr) > 0) || !(Number(price) > 0)) {
       log.warn(`${p.symbol}: valid price/ATR unavailable; guard pass fails closed`);
       continue;
     }
@@ -291,13 +305,13 @@ export async function manageOpenPositions({ notify = null } = {}) {
       log.warn(`${p.symbol}: cannot read TP/SL (${e.message}) — leaving the existing one alone`);
       tpsl = null;
     }
-    if (tpsl && !tpsl.length && atr) {
+    if (tpsl && !tpsl.length && guardAtr) {
       const synth = computeDynamicTpSl({
-        symbol: p.symbol, side: p.side, price: Number(p.avgOpenPrice) || price, atr,
+        symbol: p.symbol, side: p.side, price: Number(p.avgOpenPrice) || price, atr: guardAtr,
         timeframes: tframes,
         confidence: Number(record?.confidence || s.min_confidence),
         agreement: Number(record?.agreement || s.min_agreement),
-        atrPct: (atr / price) * 100, regime: 'RANGE',
+        atrPct: (guardAtr / price) * 100, regime: 'RANGE',
         leverage: Number(p.leverage) || null,
         maxLeverage: Number((await bitunix.pairInfo(p.symbol))?.maxLeverage) || null,
         // real maintenance margin rate for this position's notional
@@ -336,10 +350,9 @@ export async function manageOpenPositions({ notify = null } = {}) {
     // trail distance is wider than the move since breakeven: the ATR trail
     // always fell BELOW the breakeven floor and never overrode it — the
     // stop parked at breakeven "forever" even at 36% ROI (measured live).
-    // The gate falls back to the structure-TF ATR only when the 1m fetch
-    // fails, so a dead candlefeed cannot silently kill breakeven/trailing.
-    const stopPick = Number(atr) > 0 ? null : stopAtrFor({ atr, timeframes: tframes }, s);
-    const guardAtr = (Number(atr) > 0 ? atr : stopPick?.atr) || null;
+    // guardAtr (resolved near the price/ATR gate above) falls back to the
+    // structure-TF ATR only when the 1m fetch fails, so a dead candlefeed
+    // cannot silently kill breakeven/trailing.
     if (guardAtr > 0 && p.roi > 0) {
       // method 3: two trailing families.
       //   ATR              — the original: breakeven, then a stop N ATR behind.
